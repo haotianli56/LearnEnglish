@@ -272,7 +272,6 @@ def generate_image(req: ImageRequest):
                 if wants_transparent:
                     im.save(out_io, format="WEBP", lossless=True)  # 保留透明
                 else:
-                    # 不要求透明时，转成 RGB 更通用
                     im.convert("RGB").save(out_io, format="WEBP", quality=95)
                 out_bytes = out_io.getvalue()
             else:  # png
