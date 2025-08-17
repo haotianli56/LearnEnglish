@@ -1,11 +1,14 @@
 import io
 import difflib
 import re
+import base64
+import importlib
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from PIL import Image
 
 from openai import OpenAI
 import uvicorn
@@ -28,15 +31,34 @@ class ContentParams(BaseModel):
     include_answers: bool = Field(True, description="If quiz present, include answers/keys")
     use_ipa: bool = Field(True, description="Show IPA for key vocabulary")
 
+
 class ContentResponse(BaseModel):
     content: str
+
 
 class TTSRequest(BaseModel):
     text: str
     voice: str = "alloy"  # voices vary by model; 'alloy' is a safe default
     format: str = "mp3"   # mp3 | wav | flac
 
+
+class ImageRequest(BaseModel):
+    text: str = Field(..., description="Text prompt: word, sentence, or conversation")
+    size: str = Field("1024x1024", description="Image size: 256x256 | 512x512 | 1024x1024")
+    format: str = Field("png", description="png | webp | jpeg")
+    transparent_background: bool = Field(False, description="Use transparent background (png/webp only)")
+    style_hint: Optional[str] = Field(
+        default=None,
+        description="Optional style hint: 'flat icon', 'watercolor', 'storybook illustration', 'realistic photo'"
+    )
+
+
 # ---------- Helpers ----------
+
+
+VALID_SIZES = {"256x256", "512x512", "1024x1024"}
+VALID_FORMATS = {"png", "jpeg", "webp"}
+
 
 def tokenize_words(s: str) -> List[str]:
     # simple word tokenizer
@@ -181,7 +203,6 @@ def text_to_speech(req: TTSRequest):
             model="gpt-4o-mini-tts",
             voice=req.voice,
             input=req.text,
-            response_format=req.format
         )
 
         if isinstance(speech, (bytes, bytearray)):
@@ -202,6 +223,73 @@ def text_to_speech(req: TTSRequest):
     }[req.format]
 
     return StreamingResponse(io.BytesIO(audio_bytes), media_type=media_type)
+
+
+@app.post("/image/generate")
+def generate_image(req: ImageRequest):
+    if req.format not in {"png", "webp", "jpeg"}:
+        raise HTTPException(status_code=400, detail="format must be png|webp|jpeg")
+    if req.size not in VALID_SIZES:
+        raise HTTPException(status_code=400, detail=f"size must be one of {sorted(VALID_SIZES)}")
+
+    style = f"\nStyle hint: {req.style_hint}" if req.style_hint else ""
+    prompt = (
+        "Create a single, clear illustrative image that conveys the meaning of the text below. "
+        "Avoid long text in the image; small labels are acceptable if helpful."
+        f"{style}\n\nText:\n{req.text.strip()}"
+    )
+
+    gen_kwargs = dict(
+        model="gpt-image-1",
+        prompt=prompt,
+        size=req.size,
+        n=1,
+    )
+    wants_transparent = req.transparent_background and req.format in {"png", "webp"}
+    if wants_transparent:
+        gen_kwargs["background"] = "transparent"  # 不要传 "auto"
+
+    try:
+        img = client.images.generate(**gen_kwargs)
+        b64 = img.data[0].b64_json
+        png_bytes = base64.b64decode(b64)  # OpenAI 通常回的是 PNG
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image generation failed: {e}")
+
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as im:
+            if req.format == "jpeg":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                if im.mode in ("RGBA", "LA"):
+                    bg.paste(im, mask=im.split()[-1])
+                else:
+                    bg.paste(im)
+                out_io = io.BytesIO()
+                bg.save(out_io, format="JPEG", quality=95)
+                out_bytes = out_io.getvalue()
+            elif req.format == "webp":
+                out_io = io.BytesIO()
+                if wants_transparent:
+                    im.save(out_io, format="WEBP", lossless=True)  # 保留透明
+                else:
+                    # 不要求透明时，转成 RGB 更通用
+                    im.convert("RGB").save(out_io, format="WEBP", quality=95)
+                out_bytes = out_io.getvalue()
+            else:  # png
+                out_io = io.BytesIO()
+                im.save(out_io, format="PNG")
+                out_bytes = out_io.getvalue()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PIL conversion failed: {e}")
+
+    media_type = {
+        "png": "image/png",
+        "webp": "image/webp",
+        "jpeg": "image/jpeg",
+    }[req.format]
+
+    headers = {"Content-Disposition": f'inline; filename="image.{req.format}"'}
+    return StreamingResponse(io.BytesIO(out_bytes), media_type=media_type, headers=headers)
 
 
 # --------- Local runner ---------
