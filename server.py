@@ -53,6 +53,18 @@ class ImageRequest(BaseModel):
     )
 
 
+class TextTranslateRequest(BaseModel):
+    text: str = Field(..., description="Source text")
+    source_lang: str = Field("auto", description="'en' | 'zh' | 'auto'")
+    target_lang: str = Field(..., description="'en' | 'zh'")
+    style: Optional[str] = Field(None, description="Optional tone/style hints, e.g., 'formal', 'concise'")
+
+
+class TextTranslateResponse(BaseModel):
+    translation: str
+    detected_source_lang: str
+
+
 # ---------- Helpers ----------
 
 
@@ -84,6 +96,18 @@ def summarize_diff_for_llm(ops):
             if op["target"] or op["spoken"]:
                 problems.append(op)
     return correct[:50], problems[:100]
+
+
+_ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _detect_lang(text: str) -> str:
+    return "zh" if _ZH_RE.search(text) else "en"
+
+
+def _audio_mime(fmt: str) -> str:
+    return {"mp3": "audio/mpeg", "wav": "audio/wav", "flac": "audio/flac"}[fmt]
+
 
 # ---------- Routes ----------
 
@@ -289,6 +313,136 @@ def generate_image(req: ImageRequest):
 
     headers = {"Content-Disposition": f'inline; filename="image.{req.format}"'}
     return StreamingResponse(io.BytesIO(out_bytes), media_type=media_type, headers=headers)
+
+
+@app.post("/translate/text", response_model=TextTranslateResponse)
+def translate_text(req: TextTranslateRequest):
+    """Translate English⇄Chinese text. Keeps formatting and named entities intact."""
+    if req.target_lang not in {"en", "zh"}:
+        raise HTTPException(status_code=400, detail="target_lang must be 'en' or 'zh'")
+    src = req.source_lang if req.source_lang in {"en", "zh"} else _detect_lang(req.text)
+    if src == req.target_lang:
+        # No-op translation still returns content (some users expect normalization)
+        pass
+
+    tone = f" Tone/style: {req.style}." if req.style else ""
+    system_msg = (
+        "You are a professional EN↔ZH translator. Preserve meaning, dates, numbers, proper nouns, and formatting. "
+        "Prefer natural, idiomatic phrasing over literal word-by-word mapping."
+        + tone
+    )
+
+    # Ask for the translation directly (clean text back)
+    prompt = (
+        f"Source language: {src}\nTarget language: {req.target_lang}\n"
+        "Return ONLY the translation text—no brackets, no extra notes.\n\n"
+        f"TEXT:\n{req.text}"
+    )
+
+    try:
+        resp = client.responses.create(
+            model="gpt-4.1-mini",
+            temperature=0.2,
+            max_output_tokens=2000,
+            input=[
+                {"role": "system", "content": [{"type":"input_text","text": system_msg}]},
+                {"role": "user", "content": [{"type":"input_text","text": prompt}]},
+            ],
+        )
+        translation = (resp.output_text or "").strip()
+        if not translation:
+            raise RuntimeError("Empty translation result")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Translation failed: {e!s}")
+
+    return TextTranslateResponse(translation=translation, detected_source_lang=src)
+
+
+@app.post("/translate/voice")
+async def translate_voice(
+    audio: UploadFile = File(..., description="Source audio in wav/mp3/m4a"),
+    target_lang: str = Form(..., description="'en' | 'zh'"),
+    source_lang: str = Form("auto", description="'en' | 'zh' | 'auto'"),
+    voice: str = Form("alloy", description="TTS voice name"),
+    format: str = Form("mp3", description="mp3 | wav | flac"),
+    style: str = Form("", description="Optional tone/style hints"),
+):
+    """Voice→Voice translation pipeline: ASR → MT → TTS. Returns audio of the target language."""
+    if target_lang not in {"en", "zh"}:
+        raise HTTPException(status_code=400, detail="target_lang must be 'en' or 'zh'")
+    if format not in {"mp3", "wav", "flac"}:
+        raise HTTPException(status_code=400, detail="format must be mp3|wav|flac")
+
+    # 1) Transcribe source audio
+    try:
+        data = await audio.read()
+        ext = audio.filename.split(".")[-1].lower() if "." in (audio.filename or "") else "wav"
+        asr = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=(f"audio.{ext}", data),
+            # Some SDKs accept a 'language' hint; safe to omit if unsupported:
+            # language=source_lang if source_lang in {"en", "zh"} else None,
+        )
+        transcript = (asr.text or "").strip()
+        if not transcript:
+            raise RuntimeError("Empty transcription result")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Transcription failed: {e!s}")
+
+    # 2) Determine source language if needed
+    src_lang = source_lang if source_lang in {"en", "zh"} else _detect_lang(transcript)
+
+    # 3) Translate
+    tone = f" Tone/style: {style}." if style else ""
+    system_msg = (
+        "You are a professional EN↔ZH translator. Preserve meaning, names, numbers, and intent. "
+        "Make speech-friendly output that sounds natural when read aloud."
+        + tone
+    )
+    prompt = (
+        f"Source language: {src_lang}\nTarget language: {target_lang}\n"
+        "Return ONLY the translation text—no extra notes.\n\n"
+        f"TEXT:\n{transcript}"
+    )
+    try:
+        mt = client.responses.create(
+            model="gpt-4.1-mini",
+            temperature=0.2,
+            max_output_tokens=2000,
+            input=[
+                {"role": "system", "content": [{"type":"input_text","text": system_msg}]},
+                {"role": "user", "content": [{"type":"input_text","text": prompt}]},
+            ],
+        )
+        translation = (mt.output_text or "").strip()
+        if not translation:
+            raise RuntimeError("Empty translation result")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Translation failed: {e!s}")
+
+    # 4) TTS synthesis in target language
+    try:
+        speech = client.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            voice=voice,
+            input=translation,
+        )
+        if isinstance(speech, (bytes, bytearray)):
+            audio_bytes = bytes(speech)
+        elif hasattr(speech, "read"):
+            audio_bytes = speech.read()
+        elif hasattr(speech, "content"):
+            audio_bytes = speech.content
+        else:
+            audio_bytes = bytes(speech)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TTS failed: {e!s}")
+
+    headers = {
+        "Content-Disposition": f'inline; filename="translation.{format}"'
+    }
+    return StreamingResponse(io.BytesIO(audio_bytes), media_type=_audio_mime(format), headers=headers)
+
 
 
 # --------- Local runner ---------
